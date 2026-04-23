@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: chordsketch
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_MODEL
+        value: gpt-5.4-mini

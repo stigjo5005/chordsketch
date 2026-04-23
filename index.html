@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChordSketch | 간단 악보 생성기</title>
+    <meta
+      name="description"
+      content="오디오 파일이나 유튜브 링크를 넣으면 멜로디, 기타 코드, 간단 오선보를 만들어주는 반응형 웹앱"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">ChordSketch</p>
+          <h1>음원을 넣으면<br />멜로디와 기타 코드를 정리해주는 앱</h1>
+          <p class="hero-text">
+            업로드한 오디오 파일이나 유튜브 링크를 바탕으로 연습용 리드 시트를 만들어줍니다.
+            멜로디 노트, 기타 코드, 간단 오선보, 구간 요약까지 한 번에 확인할 수 있습니다.
+          </p>
+          <div class="hero-badges">
+            <span>모바일 대응</span>
+            <span>유튜브 링크 지원</span>
+            <span>PDF / 이미지 저장</span>
+          </div>
+        </div>
+        <div class="hero-panel">
+          <div class="panel-card">
+            <p class="panel-label">사용 흐름</p>
+            <ol>
+              <li>오디오 파일을 올리거나 유튜브 링크를 붙여넣기</li>
+              <li>브라우저에서 멜로디와 코드 흐름 분석</li>
+              <li>리드 시트, 오선보, 구간 요약 확인 후 저장</li>
+            </ol>
+          </div>
+        </div>
+      </header>
+
+      <main class="content-grid">
+        <section class="input-card">
+          <div class="section-head">
+            <h2>입력</h2>
+            <p>파일 업로드와 유튜브 링크 분석을 모두 지원합니다.</p>
+          </div>
+
+          <form id="analyzer-form" class="analyzer-form">
+            <label class="field">
+              <span>유튜브 링크</span>
+              <input
+                id="youtube-url"
+                type="url"
+                placeholder="https://www.youtube.com/watch?v=..."
+                autocomplete="off"
+              />
+            </label>
+
+            <label class="field file-field">
+              <span>오디오 파일</span>
+              <input
+                id="audio-file"
+                type="file"
+                accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg"
+              />
+              <small>브라우저에서 열 수 있는 일반적인 오디오 형식이면 바로 분석됩니다.</small>
+            </label>
+
+            <div class="actions">
+              <button id="analyze-button" type="submit">악보 만들기</button>
+              <button id="demo-button" type="button" class="ghost">사용 팁</button>
+            </div>
+          </form>
+
+          <div id="status" class="status-panel idle">
+            파일을 올리거나 유튜브 링크를 입력하면 분석을 시작합니다.
+          </div>
+        </section>
+
+        <section class="results-card">
+          <div class="section-head">
+            <h2>결과</h2>
+            <p>정식 채보보다 빠른 연습과 아이디어 스케치에 맞춘 형태로 정리합니다.</p>
+          </div>
+
+          <div id="summary-grid" class="summary-grid">
+            <article>
+              <span>제목</span>
+              <strong id="summary-title">입력 대기 중</strong>
+            </article>
+            <article>
+              <span>길이</span>
+              <strong id="summary-duration">-</strong>
+            </article>
+            <article>
+              <span>추정 템포</span>
+              <strong id="summary-bpm">-</strong>
+            </article>
+            <article>
+              <span>추정 키</span>
+              <strong id="summary-key">-</strong>
+            </article>
+          </div>
+
+          <section class="result-block">
+            <div class="block-head">
+              <h3>리드 시트</h3>
+              <div class="toolbar">
+                <button id="copy-button" type="button" class="ghost small">텍스트 복사</button>
+                <button id="ai-refine-button" type="button" class="ghost small">AI 보정</button>
+                <button id="print-button" type="button" class="ghost small">인쇄용 보기</button>
+                <button id="pdf-button" type="button" class="ghost small">PDF 저장</button>
+              </div>
+            </div>
+            <pre id="lead-sheet" class="lead-sheet">아직 생성된 악보가 없습니다.</pre>
+          </section>
+
+          <section class="result-block">
+            <h3>AI 보정 메모</h3>
+            <div id="ai-insights" class="insights-shell empty">
+              AI 보정을 실행하면 코드 보정 메모와 연주 팁이 여기에 표시됩니다.
+            </div>
+          </section>
+
+          <section class="result-block">
+            <div class="block-head">
+              <h3>간단 오선보</h3>
+              <div class="toolbar">
+                <button id="image-button" type="button" class="ghost small">악보 이미지 저장</button>
+              </div>
+            </div>
+            <div id="staff-notation" class="staff-shell empty">
+              분석 후 멜로디를 간단한 오선보 형태로 표시합니다.
+            </div>
+          </section>
+
+          <section class="result-block">
+            <h3>구간 요약</h3>
+            <div id="sections-summary" class="sections-shell empty">
+              분석 후 반복 패턴을 기준으로 구간을 나누어 보여줍니다.
+            </div>
+          </section>
+
+          <section class="result-block">
+            <h3>멜로디 노트</h3>
+            <div id="melody-table" class="table-shell empty">
+              분석 후 주요 멜로디 노트가 여기에 표시됩니다.
+            </div>
+          </section>
+
+          <section class="result-block">
+            <h3>코드 진행</h3>
+            <div id="chord-timeline" class="timeline empty">
+              분석 후 시간대별 추정 코드가 표시됩니다.
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <template id="timeline-item-template">
+      <article class="timeline-item">
+        <span class="time"></span>
+        <strong class="chord"></strong>
+      </article>
+    </template>
+
+    <script src="https://unpkg.com/vexflow@4.2.3/build/cjs/vexflow.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

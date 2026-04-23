@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate server syntax
+        run: python -m py_compile server.py
+
+      - name: Import server module
+        run: python -c "import server; print('server import ok')"
+
+      - name: Check deploy files
+        run: |
+          test -f Dockerfile
+          test -f render.yaml
+          test -f railway.toml
+          test -f Procfile
+          test -f .env.example
