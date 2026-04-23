@@ -385,7 +385,37 @@ function mergePitchFrames(frames, sampleRate) {
       duration: entry.end - entry.start,
     }))
     .filter((entry) => entry.duration >= 0.12)
-    .slice(0, 96);
+    .slice(0, 160)
+    .reduce((accumulator, entry) => {
+      const previous = accumulator[accumulator.length - 1];
+      if (
+        previous &&
+        Math.abs(previous.midi - entry.midi) <= 1 &&
+        entry.start - previous.end <= 0.12
+      ) {
+        previous.end = entry.end;
+        previous.duration = previous.end - previous.start;
+        previous.frequency = (previous.frequency + entry.frequency) / 2;
+        previous.midi = Math.round((previous.midi + entry.midi) / 2);
+        previous.note = frequencyToNote(previous.frequency)?.name || previous.note;
+      } else {
+        accumulator.push({ ...entry });
+      }
+      return accumulator;
+    }, [])
+    .filter((entry) => entry.duration >= 0.18)
+    .filter((entry, index, list) => {
+      const previous = list[index - 1];
+      const next = list[index + 1];
+      const isTinyBlip = entry.duration < 0.22;
+      const isLeapFromNeighbors =
+        previous &&
+        next &&
+        Math.abs(entry.midi - previous.midi) >= 5 &&
+        Math.abs(entry.midi - next.midi) >= 5;
+      return !(isTinyBlip && isLeapFromNeighbors);
+    })
+    .slice(0, 72);
 }
 
 function frequencyToNote(frequency) {
@@ -470,7 +500,7 @@ function estimateChords(notes, bpm, durationSeconds, keyLabel) {
   if (!notes.length) return [];
 
   const beatDuration = 60 / (bpm || 120);
-  const segmentDuration = Math.max(beatDuration * 2, 1.4);
+  const segmentDuration = Math.max(beatDuration * 4, 2.0);
   const segments = [];
   const keyProfile = buildKeyProfile(keyLabel);
   let previousChord = null;
@@ -487,8 +517,9 @@ function estimateChords(notes, bpm, durationSeconds, keyLabel) {
       const pitchClass = ((note.midi % 12) + 12) % 12;
       const overlap = Math.min(note.end, end) - Math.max(note.start, start);
       const weighted = Math.max(0.12, overlap);
-      const melodicBonus = note.start >= start && note.start < start + segmentDuration * 0.45 ? 1.15 : 1;
-      weights[pitchClass] += weighted * melodicBonus;
+      const melodicBonus = note.start >= start && note.start < start + segmentDuration * 0.35 ? 1.05 : 1;
+      const longNoteBonus = note.duration >= beatDuration * 0.9 ? 1.35 : 1;
+      weights[pitchClass] += weighted * melodicBonus * longNoteBonus;
       midiValues.push(note.midi);
     }
 
@@ -502,7 +533,7 @@ function estimateChords(notes, bpm, durationSeconds, keyLabel) {
     previousChord = chord;
   }
 
-  return segments;
+  return simplifyChordTimeline(segments, beatDuration);
 }
 
 function buildKeyProfile(keyLabel) {
@@ -540,6 +571,8 @@ function bestChordForWeights(weights, keyProfile, previousChord, midiValues) {
       if (bassPitch === root) score += 0.85;
       if (template.intervals.includes((melodicPeak - root + 12) % 12)) score += 0.45;
       score += diatonicHits * 0.12;
+      if (template.suffix === "7" || template.suffix === "maj7" || template.suffix === "m7") score -= 0.18;
+      if (template.suffix === "sus4") score -= 0.28;
 
       const name = `${NOTE_NAMES[root]}${template.suffix}`;
       if (previousChord === name) score += 0.65;
@@ -550,6 +583,34 @@ function bestChordForWeights(weights, keyProfile, previousChord, midiValues) {
   }
 
   return best.name;
+}
+
+function simplifyChordTimeline(segments, beatDuration) {
+  const minimumSpan = Math.max(beatDuration * 4, 2.2);
+  const simplified = [];
+
+  for (const segment of segments) {
+    const previous = simplified[simplified.length - 1];
+    const span = segment.end - segment.start;
+
+    if (previous && (previous.chord === segment.chord || span < minimumSpan)) {
+      if (span < minimumSpan && previous.chord !== segment.chord) {
+        previous.end = segment.end;
+      } else {
+        previous.end = segment.end;
+      }
+    } else {
+      simplified.push({ ...segment });
+    }
+  }
+
+  return simplified.map((segment, index, list) => {
+    const next = list[index + 1];
+    if (next && next.start - segment.end < 0.05) {
+      return { ...segment, end: next.start };
+    }
+    return segment;
+  });
 }
 
 function areRelatedChords(left, right) {
@@ -789,11 +850,12 @@ function buildAbcNotation({ title, key, bpm, notes, chords }) {
 }
 
 function createNotationEvents(notes, chords, eighthDuration) {
-  const source = notes
-    .slice(0, 40)
+  const cleanedNotes = simplifyMelodyForNotation(notes, eighthDuration);
+  const source = cleanedNotes
+    .slice(0, 32)
     .map((note) => {
       const quantizedStart = Math.max(0, Math.round(note.start / eighthDuration));
-      const quantizedDuration = Math.max(1, Math.round(note.duration / eighthDuration));
+      const quantizedDuration = quantizeDurationUnits(note.duration / eighthDuration);
       return {
         kind: "note",
         midi: note.midi,
@@ -841,6 +903,56 @@ function createNotationEvents(notes, chords, eighthDuration) {
   }
 
   return normalizeEventDurations(events);
+}
+
+function simplifyMelodyForNotation(notes, eighthDuration) {
+  return notes
+    .filter((note) => note.duration >= eighthDuration * 0.75)
+    .map((note) => ({
+      ...note,
+      start: Math.round(note.start / eighthDuration) * eighthDuration,
+      duration: quantizeDurationUnits(note.duration / eighthDuration) * eighthDuration,
+    }))
+    .reduce((accumulator, note) => {
+      const previous = accumulator[accumulator.length - 1];
+      if (
+        previous &&
+        Math.abs(previous.midi - note.midi) <= 1 &&
+        Math.abs(note.start - (previous.start + previous.duration)) <= eighthDuration * 0.75
+      ) {
+        previous.duration += note.duration;
+      } else {
+        accumulator.push({ ...note });
+      }
+      return accumulator;
+    }, [])
+    .filter((note, index, list) => {
+      const previous = list[index - 1];
+      const next = list[index + 1];
+      const isVeryShort = note.duration <= eighthDuration;
+      const largeLeap =
+        previous &&
+        next &&
+        Math.abs(note.midi - previous.midi) >= 5 &&
+        Math.abs(note.midi - next.midi) >= 5;
+      return !(isVeryShort && largeLeap);
+    });
+}
+
+function quantizeDurationUnits(rawUnits) {
+  const allowed = [1, 2, 3, 4, 6, 8];
+  let best = allowed[0];
+  let bestDistance = Infinity;
+
+  for (const candidate of allowed) {
+    const distance = Math.abs(rawUnits - candidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+
+  return best;
 }
 
 function normalizeEventDurations(events) {
