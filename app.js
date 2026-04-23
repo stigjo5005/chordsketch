@@ -718,16 +718,20 @@ function renderStaffNotation(notes, chords, key) {
     return;
   }
 
-  const VexFlow = window.Vex?.Flow;
-  if (!VexFlow) {
+  const ABCJS = window.ABCJS;
+  if (!ABCJS?.renderAbc) {
     staffNotation.className = "staff-shell empty";
-    staffNotation.textContent = "오선보 렌더링 라이브러리를 불러오지 못했습니다.";
+    staffNotation.textContent = "악보 렌더링 라이브러리를 불러오지 못했습니다.";
     return;
   }
 
-  const visibleNotes = notes.slice(0, 16);
-  const width = Math.max(760, visibleNotes.length * 62);
-  const height = 220;
+  const abcNotation = buildAbcNotation({
+    title: latestAnalysis?.title || "ChordSketch",
+    key,
+    bpm: latestAnalysis?.bpm || 120,
+    notes,
+    chords,
+  });
 
   staffNotation.className = "staff-shell";
   staffNotation.innerHTML = `
@@ -735,53 +739,216 @@ function renderStaffNotation(notes, chords, key) {
       <span>키: ${key}</span>
       ${chords.slice(0, 6).map((segment) => `<span>${segment.chord}</span>`).join("") || "<span>코드 추정 없음</span>"}
     </div>
-    <div id="staff-canvas"></div>
+    <div id="staff-canvas" class="abcjs-container"></div>
   `;
 
-  const VF = VexFlow;
-  const container = document.getElementById("staff-canvas");
-  const renderer = new VF.Renderer(container, VF.Renderer.Backends.SVG);
-  renderer.resize(width, height);
+  ABCJS.renderAbc("staff-canvas", abcNotation, {
+    add_classes: true,
+    jazzchords: true,
+    paddingbottom: 10,
+    paddingleft: 18,
+    paddingright: 18,
+    paddingtop: 10,
+    print: false,
+    responsive: "resize",
+    scale: 1.1,
+    staffwidth: 900,
+    wrap: {
+      minSpacing: 1.6,
+      preferredMeasuresPerLine: 4,
+    },
+  });
+}
 
-  const context = renderer.getContext();
-  context.setFont("Arial", 10, "").setBackgroundFillStyle("#fffdf9");
+function buildAbcNotation({ title, key, bpm, notes, chords }) {
+  const meter = "4/4";
+  const defaultUnit = 0.5;
+  const beatDuration = 60 / Math.max(60, bpm || 120);
+  const eighthDuration = beatDuration / 2;
+  const processedEvents = createNotationEvents(notes, chords, eighthDuration);
+  const measures = packEventsIntoMeasures(processedEvents, 8);
+  const abcMeasures = measures.map((measure) => measureToAbc(measure)).filter(Boolean);
+  const wrappedMeasures = [];
 
-  const stave = new VF.Stave(18, 40, width - 36);
-  stave.addClef("treble").addTimeSignature("4/4");
-  stave.setContext(context).draw();
-
-  const staveNotes = visibleNotes.map((note, index) => {
-    const keyName = midiToVexKey(note.midi);
-    const staveNote = new VF.StaveNote({
-      clef: "treble",
-      keys: [keyName],
-      duration: inferVexDuration(note.duration),
-    });
-
-    if (keyName.includes("#")) staveNote.addModifier(new VF.Accidental("#"), 0);
-
-    const activeChord = chords.find((segment) => note.start >= segment.start && note.start < segment.end);
-    const prevChord = index > 0
-      ? chords.find((segment) => visibleNotes[index - 1].start >= segment.start && visibleNotes[index - 1].start < segment.end)
-      : null;
-
-    if (activeChord && activeChord.chord !== prevChord?.chord) {
-      staveNote.addModifier(
-        new VF.Annotation(activeChord.chord)
-          .setFont("Arial", 13, "bold")
-          .setVerticalJustification(VF.Annotation.VerticalJustify.TOP),
-        0
-      );
+  abcMeasures.forEach((measure, index) => {
+    wrappedMeasures.push(measure);
+    if ((index + 1) % 4 === 0 && index !== abcMeasures.length - 1) {
+      wrappedMeasures.push("\n");
     }
-
-    return staveNote;
   });
 
-  const voice = new VF.Voice({ num_beats: staveNotes.length, beat_value: 4 });
-  voice.setStrict(false);
-  voice.addTickables(staveNotes);
-  new VF.Formatter().joinVoices([voice]).format([voice], width - 72);
-  voice.draw(context, stave);
+  return [
+    "X:1",
+    `T:${sanitizeAbcText(title)}`,
+    `M:${meter}`,
+    "L:1/8",
+    `Q:1/4=${Math.max(60, Math.round(bpm || 120))}`,
+    `K:${toAbcKey(key)}`,
+    wrappedMeasures.join(" "),
+  ].join("\n");
+}
+
+function createNotationEvents(notes, chords, eighthDuration) {
+  const source = notes
+    .slice(0, 40)
+    .map((note) => {
+      const quantizedStart = Math.max(0, Math.round(note.start / eighthDuration));
+      const quantizedDuration = Math.max(1, Math.round(note.duration / eighthDuration));
+      return {
+        kind: "note",
+        midi: note.midi,
+        startUnit: quantizedStart,
+        durationUnits: quantizedDuration,
+      };
+    })
+    .sort((left, right) => left.startUnit - right.startUnit);
+
+  const merged = [];
+  for (const event of source) {
+    const previous = merged[merged.length - 1];
+    if (
+      previous &&
+      previous.kind === "note" &&
+      previous.midi === event.midi &&
+      event.startUnit <= previous.startUnit + previous.durationUnits
+    ) {
+      previous.durationUnits = Math.max(
+        previous.durationUnits,
+        event.startUnit + event.durationUnits - previous.startUnit
+      );
+    } else {
+      merged.push({ ...event });
+    }
+  }
+
+  const events = [];
+  let cursor = 0;
+  for (const event of merged) {
+    if (event.startUnit > cursor) {
+      events.push({
+        kind: "rest",
+        startUnit: cursor,
+        durationUnits: event.startUnit - cursor,
+      });
+    }
+
+    const chordAtEvent = findChordAtUnit(chords, event.startUnit, eighthDuration);
+    events.push({
+      ...event,
+      chord: chordAtEvent,
+    });
+    cursor = event.startUnit + event.durationUnits;
+  }
+
+  return normalizeEventDurations(events);
+}
+
+function normalizeEventDurations(events) {
+  const unitsPerMeasure = 8;
+
+  return events.flatMap((event) => {
+    const parts = [];
+    let remaining = event.durationUnits;
+    let cursor = event.startUnit;
+
+    while (remaining > 0) {
+      const positionInMeasure = cursor % unitsPerMeasure;
+      const remainingInMeasure = positionInMeasure === 0 ? unitsPerMeasure : unitsPerMeasure - positionInMeasure;
+      const maxChunk = Math.min(remaining, remainingInMeasure, unitsPerMeasure);
+      parts.push({
+        ...event,
+        startUnit: cursor,
+        durationUnits: maxChunk,
+      });
+      remaining -= maxChunk;
+      cursor += maxChunk;
+    }
+
+    return parts;
+  });
+}
+
+function packEventsIntoMeasures(events, unitsPerMeasure) {
+  const measures = [];
+
+  for (const event of events) {
+    const measureIndex = Math.floor(event.startUnit / unitsPerMeasure);
+    while (measures.length <= measureIndex) {
+      measures.push([]);
+    }
+    measures[measureIndex].push(event);
+  }
+
+  return measures;
+}
+
+function measureToAbc(events) {
+  if (!events.length) {
+    return "z8 |";
+  }
+
+  let lastChord = "";
+  const tokens = events.map((event) => {
+    const duration = toAbcDuration(event.durationUnits);
+    const chordPrefix = event.chord && event.chord !== lastChord ? `"${sanitizeAbcText(event.chord)}"` : "";
+    if (event.chord) {
+      lastChord = event.chord;
+    }
+
+    if (event.kind === "rest") {
+      return `${chordPrefix}z${duration}`;
+    }
+
+    return `${chordPrefix}${midiToAbcPitch(event.midi)}${duration}`;
+  });
+
+  return `${tokens.join(" ")} |`;
+}
+
+function findChordAtUnit(chords, unit, eighthDuration) {
+  const time = unit * eighthDuration;
+  return chords.find((segment) => time >= segment.start && time < segment.end)?.chord || "";
+}
+
+function toAbcDuration(units) {
+  if (units === 1) return "";
+  return String(units);
+}
+
+function midiToAbcPitch(midi) {
+  const pitchClass = ((midi % 12) + 12) % 12;
+  const octave = Math.floor(midi / 12) - 1;
+  const sharpMap = ["C", "^C", "D", "^D", "E", "F", "^F", "G", "^G", "A", "^A", "B"];
+  const base = sharpMap[pitchClass];
+  const letter = base.endsWith("C") || base.endsWith("D") || base.endsWith("E") || base.endsWith("F") || base.endsWith("G") || base.endsWith("A") || base.endsWith("B")
+    ? base[base.length - 1]
+    : "C";
+  const accidental = base.startsWith("^") ? "^" : "";
+
+  if (octave < 4) {
+    return `${accidental}${letter}${",".repeat(4 - octave)}`;
+  }
+  if (octave === 4) {
+    return `${accidental}${letter}`;
+  }
+
+  return `${accidental}${letter.toLowerCase()}${"'".repeat(octave - 5)}`;
+}
+
+function toAbcKey(key) {
+  const [tonicName, mode] = String(key || "C Major").split(" ");
+  if (!tonicName) {
+    return "C";
+  }
+
+  if (mode === "Minor") {
+    return `${tonicName}m`;
+  }
+  return tonicName;
+}
+
+function sanitizeAbcText(text) {
+  return String(text || "").replaceAll('"', "'").replaceAll("\n", " ").trim();
 }
 
 function renderSections(sections) {
@@ -1040,17 +1207,4 @@ function formatDuration(seconds) {
 
 function formatTime(seconds) {
   return seconds.toFixed(1).padStart(4, "0");
-}
-
-function midiToVexKey(midi) {
-  const noteIndex = ((midi % 12) + 12) % 12;
-  const octave = Math.floor(midi / 12) - 1;
-  return `${NOTE_NAMES[noteIndex].toLowerCase()}/${octave}`;
-}
-
-function inferVexDuration(durationSeconds) {
-  if (durationSeconds >= 0.9) return "h";
-  if (durationSeconds >= 0.45) return "q";
-  if (durationSeconds >= 0.23) return "8";
-  return "16";
 }

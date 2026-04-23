@@ -326,6 +326,21 @@ button.small {
   height: auto;
 }
 
+.staff-shell .abcjs-container {
+  min-width: 760px;
+}
+
+.staff-shell .abcjs-note_selected,
+.staff-shell .abcjs-note:hover {
+  fill: #cf5e2e;
+}
+
+.staff-shell .abcjs-staff,
+.staff-shell .abcjs-bar,
+.staff-shell .abcjs-ledger {
+  stroke-width: 1.2px;
+}
+
 .staff-caption {
   display: flex;
   flex-wrap: wrap;
