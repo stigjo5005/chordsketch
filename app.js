@@ -50,17 +50,15 @@ form.addEventListener("submit", async (event) => {
     analyzeButton.disabled = true;
 
     if (file) {
-      setStatus("업로드한 파일을 해석하면서 멜로디와 코드를 추정하는 중입니다...", "loading");
-      const analysis = await analyzeAudioSource(file, file.name);
+      setStatus("업로드한 파일을 서버에서 분석하면서 멜로디와 코드를 정리하는 중입니다...", "loading");
+      const analysis = await analyzeUploadedAudio(file);
       renderAnalysis(analysis);
       setStatus("분석이 완료되었습니다. 아래 결과를 확인해 보세요.", "success");
       return;
     }
 
-    setStatus("유튜브에서 오디오를 가져오는 중입니다. 잠시만 기다려 주세요...", "loading");
-    const downloadedFile = await fetchYoutubeAudio(youtubeUrl);
-    setStatus("오디오를 가져왔습니다. 멜로디와 코드를 분석하는 중입니다...", "loading");
-    const analysis = await analyzeAudioSource(downloadedFile, downloadedFile.name);
+    setStatus("유튜브 오디오를 가져와서 서버에서 분석하는 중입니다. 잠시만 기다려 주세요...", "loading");
+    const analysis = await analyzeYoutubeUrl(youtubeUrl);
     renderAnalysis(analysis);
     setStatus("유튜브 링크 분석이 완료되었습니다. 결과가 준비되었어요.", "success");
   } catch (error) {
@@ -170,6 +168,57 @@ async function fetchYoutubeAudio(url) {
   return new File([blob], `${title}.${extension}`, {
     type: blob.type || "audio/webm",
   });
+}
+
+async function analyzeUploadedAudio(file) {
+  const response = await fetch(`/api/audio-analyze?title=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+    },
+    body: await file.arrayBuffer(),
+  });
+
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(payload.error || "서버 파일 분석에 실패했습니다.");
+  }
+  return enrichBackendAnalysis(payload);
+}
+
+async function analyzeYoutubeUrl(url) {
+  const response = await fetch("/api/youtube-analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(payload.error || "유튜브 서버 분석에 실패했습니다.");
+  }
+  return enrichBackendAnalysis(payload);
+}
+
+function enrichBackendAnalysis(payload) {
+  const leadSheetText = buildLeadSheet({
+    title: payload.title,
+    bpm: payload.bpm,
+    key: payload.key,
+    durationSeconds: payload.durationSeconds,
+    notes: payload.notes || [],
+    chords: payload.chords || [],
+    sections: payload.sections || [],
+    wasTrimmed: Boolean(payload.wasTrimmed),
+  });
+
+  return {
+    ...payload,
+    notes: payload.notes || [],
+    chords: payload.chords || [],
+    sections: payload.sections || [],
+    leadSheetText,
+  };
 }
 
 async function refineAnalysisWithAI(analysis) {

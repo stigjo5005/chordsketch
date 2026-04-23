@@ -1,10 +1,15 @@
 import json
 import os
+import tempfile
 import urllib.error
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
+import numpy as np
+import torch
+import torchaudio
 from yt_dlp import YoutubeDL
 
 
@@ -45,6 +50,12 @@ class ChordSketchHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/youtube-download":
             self.handle_youtube_download()
             return
+        if self.path.startswith("/api/audio-analyze"):
+            self.handle_audio_analyze()
+            return
+        if self.path.startswith("/api/youtube-analyze"):
+            self.handle_youtube_analyze()
+            return
         if self.path == "/api/ai-refine":
             self.handle_ai_refine()
             return
@@ -72,6 +83,38 @@ class ChordSketchHandler(SimpleHTTPRequestHandler):
                 },
                 status=500,
             )
+
+    def handle_audio_analyze(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            title = (params.get("title") or ["audio-file"])[0]
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0:
+                self.respond_json({"error": "분석할 오디오 데이터가 없습니다."}, status=400)
+                return
+
+            audio_bytes = self.rfile.read(content_length)
+            analysis = analyze_audio_bytes(audio_bytes, title)
+            self.respond_json(analysis)
+        except Exception as error:
+            self.respond_json({"error": f"서버 오디오 분석에 실패했습니다: {error}"}, status=500)
+
+    def handle_youtube_analyze(self) -> None:
+        try:
+            payload = self.read_json_body()
+            url = payload.get("url", "").strip()
+            if not url:
+                self.respond_json({"error": "유튜브 링크가 필요합니다."}, status=400)
+                return
+
+            download = download_youtube_audio(url)
+            file_path = ROOT / download["audioPath"].lstrip("/")
+            analysis = analyze_audio_file(file_path, download["title"])
+            analysis["sourceUrl"] = url
+            self.respond_json(analysis)
+        except Exception as error:
+            self.respond_json({"error": f"유튜브 분석에 실패했습니다: {error}"}, status=500)
 
     def handle_ai_refine(self) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -163,6 +206,359 @@ def download_youtube_audio(url: str) -> dict:
         "audioPath": f"/{relative_path}",
         "sourceUrl": url,
     }
+
+
+def analyze_audio_bytes(audio_bytes: bytes, title: str) -> dict:
+    suffix = Path(title).suffix or ".bin"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+        temp.write(audio_bytes)
+        temp_path = Path(temp.name)
+
+    try:
+        return analyze_audio_file(temp_path, title)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def analyze_audio_file(file_path: Path, title: str) -> dict:
+    waveform, sample_rate = torchaudio.load(str(file_path))
+    if waveform.ndim > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    max_seconds = 90
+    max_samples = min(waveform.shape[-1], sample_rate * max_seconds)
+    waveform = waveform[:, :max_samples]
+    mono = waveform.squeeze(0)
+
+    bpm = estimate_tempo_backend(mono, sample_rate)
+    notes = extract_notes_backend(mono, sample_rate)
+    key = estimate_key_backend(notes)
+    duration_seconds = round(float(mono.shape[-1] / sample_rate), 2)
+    chords = estimate_chords_backend(mono, sample_rate, bpm, key)
+    sections = detect_sections_backend(chords, duration_seconds)
+
+    return {
+        "title": title,
+        "durationSeconds": duration_seconds,
+        "bpm": int(round(bpm)),
+        "key": key,
+        "notes": notes,
+        "chords": chords,
+        "sections": sections,
+        "wasTrimmed": waveform.shape[-1] < sample_rate * max_seconds,
+        "analysisSource": "backend",
+    }
+
+
+def estimate_tempo_backend(mono: torch.Tensor, sample_rate: int) -> float:
+    frame = 1024
+    hop = 512
+    if mono.numel() < frame * 2:
+        return 120.0
+
+    windows = mono.unfold(0, frame, hop)
+    energy = torch.sqrt((windows**2).mean(dim=1) + 1e-8)
+    flux = torch.clamp(energy[1:] - energy[:-1], min=0)
+    if flux.numel() == 0:
+        return 120.0
+
+    best_bpm = 120
+    best_score = -1.0
+    for bpm in range(70, 181):
+        lag = max(1, round((60 / bpm) * sample_rate / hop))
+        if lag >= flux.numel():
+            continue
+        score = torch.dot(flux[lag:], flux[:-lag]).item()
+        if score > best_score:
+            best_score = score
+            best_bpm = bpm
+    return float(best_bpm)
+
+
+def extract_notes_backend(mono: torch.Tensor, sample_rate: int) -> list[dict]:
+    frame_time = 0.02
+    win_length = int(sample_rate * frame_time)
+    if mono.numel() < win_length:
+        return []
+
+    pitch = torchaudio.functional.detect_pitch_frequency(
+        mono.unsqueeze(0),
+        sample_rate=sample_rate,
+        frame_time=frame_time,
+        freq_low=82,
+        freq_high=880,
+    ).squeeze(0)
+
+    energies = mono.unfold(0, win_length, win_length).pow(2).mean(dim=1).sqrt()
+    length = min(pitch.numel(), energies.numel())
+    pitch = pitch[:length]
+    energies = energies[:length]
+
+    events: list[dict] = []
+    step = frame_time
+    for index in range(length):
+        frequency = float(pitch[index].item())
+        energy = float(energies[index].item())
+        time = round(index * step, 3)
+        if not np.isfinite(frequency) or frequency < 82 or frequency > 880 or energy < 0.018:
+            continue
+
+        midi = int(round(69 + 12 * np.log2(frequency / 440.0)))
+        previous = events[-1] if events else None
+        if previous and abs(previous["midi"] - midi) <= 1 and time - previous["end"] <= 0.05:
+            previous["end"] = round(time + step, 3)
+            previous["frequency_sum"] += frequency
+            previous["count"] += 1
+        else:
+            events.append(
+                {
+                    "midi": midi,
+                    "start": time,
+                    "end": round(time + step, 3),
+                    "frequency_sum": frequency,
+                    "count": 1,
+                }
+            )
+
+    cleaned: list[dict] = []
+    for event in events:
+        duration = round(event["end"] - event["start"], 3)
+        if duration < 0.18:
+            continue
+        frequency = event["frequency_sum"] / event["count"]
+        note_name = midi_to_note_name(event["midi"])
+        cleaned.append(
+            {
+                "note": note_name,
+                "midi": int(event["midi"]),
+                "start": round(event["start"], 2),
+                "end": round(event["end"], 2),
+                "duration": round(duration, 2),
+                "frequency": round(frequency, 1),
+            }
+        )
+
+    return simplify_notes_backend(cleaned)[:48]
+
+
+def simplify_notes_backend(notes: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    for note in notes:
+        previous = merged[-1] if merged else None
+        if (
+            previous
+            and abs(previous["midi"] - note["midi"]) <= 1
+            and note["start"] - previous["end"] <= 0.12
+        ):
+            previous["end"] = note["end"]
+            previous["duration"] = round(previous["end"] - previous["start"], 2)
+            previous["midi"] = int(round((previous["midi"] + note["midi"]) / 2))
+            previous["frequency"] = round((previous["frequency"] + note["frequency"]) / 2, 1)
+            previous["note"] = midi_to_note_name(previous["midi"])
+        else:
+            merged.append(dict(note))
+
+    result: list[dict] = []
+    for idx, note in enumerate(merged):
+        previous = merged[idx - 1] if idx > 0 else None
+        next_note = merged[idx + 1] if idx + 1 < len(merged) else None
+        is_blip = note["duration"] <= 0.22
+        is_outlier = (
+            previous
+            and next_note
+            and abs(note["midi"] - previous["midi"]) >= 5
+            and abs(note["midi"] - next_note["midi"]) >= 5
+        )
+        if is_blip and is_outlier:
+            continue
+        result.append(note)
+    return result
+
+
+def estimate_key_backend(notes: list[dict]) -> str:
+    if not notes:
+        return "Unknown"
+
+    weights = np.zeros(12, dtype=np.float32)
+    for note in notes:
+        weights[note["midi"] % 12] += max(0.1, note["duration"])
+
+    major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+    minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+    best_score = -1.0
+    best_label = "Unknown"
+    for tonic in range(12):
+        major_score = float(np.dot(weights, np.roll(major, tonic)))
+        minor_score = float(np.dot(weights, np.roll(minor, tonic)))
+        if major_score > best_score:
+            best_score = major_score
+            best_label = f"{NOTE_NAMES[tonic]} Major"
+        if minor_score > best_score:
+            best_score = minor_score
+            best_label = f"{NOTE_NAMES[tonic]} Minor"
+    return best_label
+
+
+def estimate_chords_backend(mono: torch.Tensor, sample_rate: int, bpm: float, key_label: str) -> list[dict]:
+    beat_duration = 60.0 / max(60.0, bpm)
+    segment_seconds = max(beat_duration * 4, 2.0)
+    segment_samples = max(2048, int(sample_rate * segment_seconds))
+    hop_samples = segment_samples
+
+    if mono.numel() < segment_samples:
+        return []
+
+    spec = torch.stft(
+        mono,
+        n_fft=4096,
+        hop_length=1024,
+        win_length=4096,
+        window=torch.hann_window(4096),
+        return_complex=True,
+    )
+    magnitude = spec.abs()
+    frequencies = torch.fft.rfftfreq(4096, d=1 / sample_rate)
+    key_profile = build_key_profile_backend(key_label)
+
+    segments: list[dict] = []
+    previous_chord = ""
+    for start_sample in range(0, mono.numel() - segment_samples + 1, hop_samples):
+        end_sample = min(start_sample + segment_samples, mono.numel())
+        frame_start = start_sample // 1024
+        frame_end = max(frame_start + 1, end_sample // 1024)
+        chroma = np.zeros(12, dtype=np.float32)
+
+        for bin_index, frequency in enumerate(frequencies):
+            freq = float(frequency.item())
+            if freq < 82 or freq > 1200:
+                continue
+            midi = int(round(69 + 12 * np.log2(freq / 440.0)))
+            pitch_class = midi % 12
+            energy = float(magnitude[bin_index, frame_start:frame_end].mean().item())
+            chroma[pitch_class] += energy
+
+        chord = best_chord_for_chroma(chroma, key_profile, previous_chord)
+        segment = {
+            "start": round(start_sample / sample_rate, 2),
+            "end": round(end_sample / sample_rate, 2),
+            "chord": chord,
+        }
+        if segments and segments[-1]["chord"] == chord:
+            segments[-1]["end"] = segment["end"]
+        else:
+            segments.append(segment)
+        previous_chord = chord
+
+    return simplify_chord_segments_backend(segments, beat_duration)
+
+
+def build_key_profile_backend(key_label: str) -> set[int]:
+    tonic_name, _, mode = key_label.partition(" ")
+    if tonic_name not in NOTE_NAMES:
+        return set()
+    tonic = NOTE_NAMES.index(tonic_name)
+    scale = [0, 2, 3, 5, 7, 8, 10] if mode == "Minor" else [0, 2, 4, 5, 7, 9, 11]
+    return {(tonic + interval) % 12 for interval in scale}
+
+
+def best_chord_for_chroma(chroma: np.ndarray, key_profile: set[int], previous_chord: str) -> str:
+    best_score = -1e9
+    best_name = "N.C."
+    for root in range(12):
+        for suffix, intervals in [
+            ("", [0, 4, 7]),
+            ("m", [0, 3, 7]),
+            ("7", [0, 4, 7, 10]),
+            ("maj7", [0, 4, 7, 11]),
+            ("m7", [0, 3, 7, 10]),
+        ]:
+            hit = 0.0
+            miss = 0.0
+            diatonic = 0.0
+            for pitch in range(12):
+                interval = (pitch - root) % 12
+                if interval in intervals:
+                    hit += chroma[pitch] * 1.35
+                    if pitch in key_profile:
+                        diatonic += 0.12
+                else:
+                    miss += chroma[pitch] * 0.42
+
+            score = hit - miss + diatonic
+            if suffix in {"7", "maj7", "m7"}:
+                score -= 0.18
+            name = f"{NOTE_NAMES[root]}{suffix}"
+            if name == previous_chord:
+                score += 0.5
+            if score > best_score:
+                best_score = score
+                best_name = name
+    return best_name
+
+
+def simplify_chord_segments_backend(segments: list[dict], beat_duration: float) -> list[dict]:
+    minimum_span = max(beat_duration * 4, 2.2)
+    simplified: list[dict] = []
+    for segment in segments:
+        span = segment["end"] - segment["start"]
+        previous = simplified[-1] if simplified else None
+        if previous and (segment["chord"] == previous["chord"] or span < minimum_span):
+            previous["end"] = segment["end"]
+        else:
+            simplified.append(dict(segment))
+    return simplified
+
+
+def detect_sections_backend(chords: list[dict], duration_seconds: float) -> list[dict]:
+    if not chords:
+        return []
+
+    window = max(6.0, min(12.0, duration_seconds / 6 if duration_seconds else 8.0))
+    raw: list[dict] = []
+    current = 0.0
+    while current < duration_seconds:
+        end = min(current + window, duration_seconds)
+        active = [segment["chord"] for segment in chords if segment["end"] > current and segment["start"] < end]
+        if active:
+            raw.append(
+                {
+                    "start": round(current, 2),
+                    "end": round(end, 2),
+                    "signature": "-".join(active[:4]),
+                    "chords": list(dict.fromkeys(active)),
+                }
+            )
+        current = end
+
+    labels: dict[str, str] = {}
+    next_label = 0
+    sections: list[dict] = []
+    for section in raw:
+        signature = section["signature"]
+        if signature not in labels:
+            labels[signature] = chr(65 + next_label)
+            next_label += 1
+        label = labels[signature]
+        summary = "반복 진행" if section["chords"] else "구간"
+        sections.append(
+            {
+                "label": label,
+                "start": section["start"],
+                "end": section["end"],
+                "summary": summary,
+                "chords": section["chords"],
+            }
+        )
+    return sections
+
+
+def midi_to_note_name(midi: int) -> str:
+    octave = midi // 12 - 1
+    return f"{NOTE_NAMES[midi % 12]}{octave}"
 
 
 def refine_with_openai(analysis: dict, api_key: str) -> dict:
