@@ -57,7 +57,16 @@ class ChordSketchHandler(SimpleHTTPRequestHandler):
             result = download_youtube_audio(url)
             self.respond_json(result)
         except Exception as error:
-            self.respond_json({"error": f"다운로드에 실패했습니다: {error}"}, status=500)
+            self.respond_json(
+                {
+                    "error": (
+                        "유튜브 다운로드에 실패했습니다. "
+                        "영상 자체 제한이 있거나 Render 환경에서 접근이 막힌 경우일 수 있습니다. "
+                        f"상세: {error}"
+                    )
+                },
+                status=500,
+            )
 
     def handle_ai_refine(self) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -91,24 +100,57 @@ class ChordSketchHandler(SimpleHTTPRequestHandler):
 
 
 def download_youtube_audio(url: str) -> dict:
-    options = {
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-        "outtmpl": str(DOWNLOADS_DIR / "%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "proxy": "",
-        "restrictfilenames": True,
-        "overwrites": False,
-    }
+    fallback_runs = [
+        {
+            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        },
+        {
+            "extractor_args": {"youtube": {"player_client": ["tv", "web"]}},
+            "format": "bestaudio[protocol!=m3u8]/bestaudio/best",
+        },
+        {
+            "extractor_args": {"youtube": {"player_client": ["ios", "web"]}},
+            "format": "bestaudio/best",
+        },
+    ]
 
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        requested = info.get("requested_downloads") or []
-        if requested and requested[0].get("filepath"):
-            file_path = Path(requested[0]["filepath"])
-        else:
-            file_path = Path(ydl.prepare_filename(info))
+    errors: list[str] = []
+    info = None
+    file_path = None
+
+    for fallback in fallback_runs:
+        options = {
+            "extractor_args": fallback["extractor_args"],
+            "format": fallback["format"],
+            "outtmpl": str(DOWNLOADS_DIR / "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "proxy": "",
+            "quiet": True,
+            "restrictfilenames": True,
+            "overwrites": False,
+            "retries": 2,
+            "socket_timeout": 30,
+        }
+
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+                requested = info.get("requested_downloads") or []
+                if requested and requested[0].get("filepath"):
+                    file_path = Path(requested[0]["filepath"])
+                else:
+                    file_path = Path(ydl.prepare_filename(info))
+            break
+        except Exception as error:
+            errors.append(str(error))
+
+    if info is None or file_path is None:
+        joined = " | ".join(errors[-3:])
+        raise RuntimeError(
+            "유튜브 오디오를 가져오지 못했습니다. 일부 영상은 유튜브 제한 때문에 직접 다운로드가 막힐 수 있습니다. "
+            f"마지막 오류: {joined}"
+        )
 
     relative_path = file_path.relative_to(ROOT).as_posix()
     return {
