@@ -24,6 +24,11 @@ class ChordSketchHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
+    def end_headers(self) -> None:
+        if self.path.endswith((".html", ".js", ".css")) or self.path == "/":
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def do_GET(self) -> None:
         if self.path == "/health":
             self.respond_json(

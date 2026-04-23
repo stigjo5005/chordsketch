@@ -153,7 +153,7 @@ async function fetchYoutubeAudio(url) {
     body: JSON.stringify({ url }),
   });
 
-  const payload = await response.json();
+  const payload = await readJsonResponse(response);
   if (!response.ok) {
     throw new Error(payload.error || "유튜브 오디오를 가져오지 못했습니다.");
   }
@@ -187,11 +187,20 @@ async function refineAnalysisWithAI(analysis) {
     }),
   });
 
-  const payload = await response.json();
+  const payload = await readJsonResponse(response);
   if (!response.ok) {
     throw new Error(payload.error || "AI 보정 응답을 받지 못했습니다.");
   }
   return payload;
+}
+
+async function readJsonResponse(response) {
+  const rawText = await response.text();
+  try {
+    return rawText ? JSON.parse(rawText) : {};
+  } catch (_error) {
+    throw new Error(`서버가 JSON 대신 다음 응답을 보냈습니다: ${rawText.slice(0, 140)}`);
+  }
 }
 
 function extractFileName(path) {
