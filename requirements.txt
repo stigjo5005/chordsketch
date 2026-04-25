@@ -1,1 +1,7 @@
+basic-pitch==0.4.0
+demucs==4.0.1
+librosa>=0.11.0
+numpy<2
+torch==2.2.2
+torchaudio==2.2.2
 yt-dlp>=2026.3.17

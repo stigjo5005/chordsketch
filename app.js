@@ -50,14 +50,14 @@ form.addEventListener("submit", async (event) => {
     analyzeButton.disabled = true;
 
     if (file) {
-      setStatus("업로드한 파일을 서버에서 분석하면서 멜로디와 코드를 정리하는 중입니다...", "loading");
+      setStatus("보컬/반주를 분리한 뒤 멜로디와 코드를 분석하는 중입니다. 1-3분 정도 걸릴 수 있습니다...", "loading");
       const analysis = await analyzeUploadedAudio(file);
       renderAnalysis(analysis);
       setStatus("분석이 완료되었습니다. 아래 결과를 확인해 보세요.", "success");
       return;
     }
 
-    setStatus("유튜브 오디오를 가져와서 서버에서 분석하는 중입니다. 잠시만 기다려 주세요...", "loading");
+    setStatus("유튜브 오디오를 가져와 보컬/반주 분리 후 분석하는 중입니다. 1-3분 정도 걸릴 수 있습니다...", "loading");
     const analysis = await analyzeYoutubeUrl(youtubeUrl);
     renderAnalysis(analysis);
     setStatus("유튜브 링크 분석이 완료되었습니다. 결과가 준비되었어요.", "success");
@@ -748,6 +748,7 @@ function buildLeadSheet({ title, bpm, key, durationSeconds, notes, chords, secti
     `TIME   ${formatDuration(durationSeconds)}${wasTrimmed ? " (앞 90초 기준)" : ""}`,
     `BPM    ${bpm}`,
     `KEY    ${key}`,
+    "BASIS  앞 90초 / 4분의 4 / 추정 BPM / 마디 단위 코드 스케치",
     "",
     "SECTIONS",
     sectionLine || "구간 추정 없음",
@@ -839,6 +840,7 @@ function renderStaffNotation(notes, chords, key) {
     title: latestAnalysis?.title || "ChordSketch",
     key,
     bpm: latestAnalysis?.bpm || 120,
+    durationSeconds: latestAnalysis?.durationSeconds || 0,
     notes,
     chords,
   });
@@ -847,6 +849,8 @@ function renderStaffNotation(notes, chords, key) {
   staffNotation.innerHTML = `
     <div class="staff-caption">
       <span>키: ${key}</span>
+      <span>${escapeHtml(latestAnalysis?.analysisBasis || "추정 BPM과 감지 노트를 기준으로 만든 스케치입니다.")}</span>
+      ${(latestAnalysis?.warnings || []).map((warning) => `<span class="warning-chip">${escapeHtml(warning)}</span>`).join("")}
       ${chords.slice(0, 6).map((segment) => `<span>${segment.chord}</span>`).join("") || "<span>코드 추정 없음</span>"}
     </div>
     <div id="staff-canvas" class="abcjs-container"></div>
@@ -870,14 +874,15 @@ function renderStaffNotation(notes, chords, key) {
   });
 }
 
-function buildAbcNotation({ title, key, bpm, notes, chords }) {
+function buildAbcNotation({ title, key, bpm, durationSeconds, notes, chords }) {
   const meter = "4/4";
   const defaultUnit = 0.5;
   const beatDuration = 60 / Math.max(60, bpm || 120);
   const eighthDuration = beatDuration / 2;
-  const processedEvents = createNotationEvents(notes, chords, eighthDuration);
+  const processedEvents = createNotationEvents(notes, chords, eighthDuration, durationSeconds);
   const measures = packEventsIntoMeasures(processedEvents, 8);
-  const abcMeasures = measures.map((measure) => measureToAbc(measure)).filter(Boolean);
+  const chordState = { lastChord: "" };
+  const abcMeasures = measures.map((measure) => measureToAbc(measure, chordState)).filter(Boolean);
   const wrappedMeasures = [];
 
   abcMeasures.forEach((measure, index) => {
@@ -898,10 +903,9 @@ function buildAbcNotation({ title, key, bpm, notes, chords }) {
   ].join("\n");
 }
 
-function createNotationEvents(notes, chords, eighthDuration) {
+function createNotationEvents(notes, chords, eighthDuration, durationSeconds) {
   const cleanedNotes = simplifyMelodyForNotation(notes, eighthDuration);
   const source = cleanedNotes
-    .slice(0, 32)
     .map((note) => {
       const quantizedStart = Math.max(0, Math.round(note.start / eighthDuration));
       const quantizedDuration = quantizeDurationUnits(note.duration / eighthDuration);
@@ -949,6 +953,15 @@ function createNotationEvents(notes, chords, eighthDuration) {
       chord: chordAtEvent,
     });
     cursor = event.startUnit + event.durationUnits;
+  }
+
+  const totalUnits = Math.max(cursor, Math.ceil((durationSeconds || 0) / eighthDuration));
+  if (totalUnits > cursor) {
+    events.push({
+      kind: "rest",
+      startUnit: cursor,
+      durationUnits: totalUnits - cursor,
+    });
   }
 
   return normalizeEventDurations(events);
@@ -1043,17 +1056,17 @@ function packEventsIntoMeasures(events, unitsPerMeasure) {
   return measures;
 }
 
-function measureToAbc(events) {
+function measureToAbc(events, chordState = { lastChord: "" }) {
   if (!events.length) {
     return "z8 |";
   }
 
-  let lastChord = "";
   const tokens = events.map((event) => {
     const duration = toAbcDuration(event.durationUnits);
-    const chordPrefix = event.chord && event.chord !== lastChord ? `"${sanitizeAbcText(event.chord)}"` : "";
+    const chordPrefix =
+      event.chord && event.chord !== chordState.lastChord ? `"${sanitizeAbcText(event.chord)}"` : "";
     if (event.chord) {
-      lastChord = event.chord;
+      chordState.lastChord = event.chord;
     }
 
     if (event.kind === "rest") {

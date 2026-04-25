@@ -356,6 +356,11 @@ button.small {
   white-space: nowrap;
 }
 
+.staff-caption .warning-chip {
+  background: #fff1d6;
+  color: #7d4a00;
+}
+
 .sections-shell {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

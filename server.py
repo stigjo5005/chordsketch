@@ -1,8 +1,12 @@
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +23,8 @@ DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+MAX_ANALYSIS_SECONDS = 90
 
 
 class ChordSketchHTTPServer(ThreadingHTTPServer):
@@ -224,33 +230,172 @@ def analyze_audio_bytes(audio_bytes: bytes, title: str) -> dict:
 
 
 def analyze_audio_file(file_path: Path, title: str) -> dict:
-    waveform, sample_rate = torchaudio.load(str(file_path))
-    if waveform.ndim > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
+    analysis_path, cleanup_path = prepare_audio_for_analysis(file_path)
+    stem_cleanup_dir: Path | None = None
 
-    max_seconds = 90
-    max_samples = min(waveform.shape[-1], sample_rate * max_seconds)
-    waveform = waveform[:, :max_samples]
-    mono = waveform.squeeze(0)
+    try:
+        stem_paths, stem_cleanup_dir = separate_sources_backend(analysis_path)
+        melody_path = stem_paths.get("vocals", analysis_path)
+        harmony_path = stem_paths.get("accompaniment", analysis_path)
+        waveform, sample_rate = load_audio_backend(harmony_path)
 
-    bpm = estimate_tempo_backend(mono, sample_rate)
-    notes = extract_notes_backend(mono, sample_rate)
-    key = estimate_key_backend(notes)
-    duration_seconds = round(float(mono.shape[-1] / sample_rate), 2)
-    chords = estimate_chords_backend(mono, sample_rate, bpm, key)
-    sections = detect_sections_backend(chords, duration_seconds)
+        max_seconds = MAX_ANALYSIS_SECONDS
+        max_samples = min(waveform.shape[-1], sample_rate * max_seconds)
+        waveform = waveform[:, :max_samples]
+        mono = waveform.squeeze(0)
 
-    return {
-        "title": title,
-        "durationSeconds": duration_seconds,
-        "bpm": int(round(bpm)),
-        "key": key,
-        "notes": notes,
-        "chords": chords,
-        "sections": sections,
-        "wasTrimmed": waveform.shape[-1] < sample_rate * max_seconds,
-        "analysisSource": "backend",
-    }
+        bpm = estimate_tempo_librosa_backend(harmony_path) or estimate_tempo_backend(mono, sample_rate)
+        notes = extract_notes_backend(mono, sample_rate, melody_path)
+        key = estimate_key_backend(notes)
+        duration_seconds = round(float(mono.shape[-1] / sample_rate), 2)
+        chords = estimate_chords_librosa_backend(harmony_path, bpm, key, duration_seconds)
+        if not chords:
+            chords = estimate_chords_backend(mono, sample_rate, bpm, key)
+        sections = detect_sections_backend(chords, duration_seconds)
+        source_separation = "demucs" if stem_paths else "none"
+
+        return {
+            "title": title,
+            "durationSeconds": duration_seconds,
+            "bpm": int(round(bpm)),
+            "key": key,
+            "notes": notes,
+            "chords": chords,
+            "sections": sections,
+            "wasTrimmed": waveform.shape[-1] < sample_rate * max_seconds,
+            "analysisSource": "backend",
+            "analysisBasis": build_analysis_basis_backend(source_separation),
+            "sourceSeparation": source_separation,
+            "warnings": build_analysis_warnings_backend(chords, duration_seconds, source_separation),
+        }
+    finally:
+        if stem_cleanup_dir is not None:
+            try:
+                shutil.rmtree(stem_cleanup_dir, ignore_errors=True)
+            except Exception:
+                pass
+        if cleanup_path is not None:
+            try:
+                cleanup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def separate_sources_backend(file_path: Path) -> tuple[dict[str, Path], Path | None]:
+    if os.getenv("CHORDSKETCH_SEPARATE_STEMS", "1").strip() in {"0", "false", "False"}:
+        return {}, None
+
+    try:
+        import demucs  # noqa: F401
+    except Exception:
+        return {}, None
+
+    output_root = Path(tempfile.gettempdir()) / f"chordsketch-stems-{uuid.uuid4().hex}"
+    command = [
+        sys.executable,
+        "-m",
+        "demucs.separate",
+        "--two-stems",
+        "vocals",
+        "-n",
+        "htdemucs",
+        "--out",
+        str(output_root),
+        str(file_path),
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, timeout=240)
+    except Exception:
+        shutil.rmtree(output_root, ignore_errors=True)
+        return {}, None
+
+    stem_dir = output_root / "htdemucs" / file_path.stem
+    vocals = stem_dir / "vocals.wav"
+    accompaniment = stem_dir / "no_vocals.wav"
+    if vocals.exists() and accompaniment.exists():
+        return {"vocals": vocals, "accompaniment": accompaniment}, output_root
+
+    shutil.rmtree(output_root, ignore_errors=True)
+    return {}, None
+
+
+def prepare_audio_for_analysis(file_path: Path) -> tuple[Path, Path | None]:
+    ffmpeg_path = find_ffmpeg_backend()
+    if not ffmpeg_path:
+        return file_path, None
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp:
+        wav_path = Path(temp.name)
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(file_path),
+        "-t",
+        str(MAX_ANALYSIS_SECONDS),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "22050",
+        str(wav_path),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True)
+    except Exception:
+        try:
+            wav_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return file_path, None
+
+    return wav_path, wav_path
+
+
+def find_ffmpeg_backend() -> str:
+    configured = os.getenv("FFMPEG_BINARY", "").strip()
+    if configured:
+        return configured
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    winget_link = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe"
+    try:
+        target = Path(winget_link).resolve(strict=True)
+        if target.exists():
+            return str(target)
+    except Exception:
+        pass
+
+    winget_packages = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+    for candidate in winget_packages.glob("Gyan.FFmpeg_*/*/bin/ffmpeg.exe"):
+        if candidate.exists():
+            return str(candidate)
+
+    return ""
+
+
+def load_audio_backend(file_path: Path) -> tuple[torch.Tensor, int]:
+    try:
+        waveform, sample_rate = torchaudio.load(str(file_path))
+        if waveform.ndim > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        return waveform, sample_rate
+    except Exception as torchaudio_error:
+        try:
+            import librosa
+
+            audio, sample_rate = librosa.load(str(file_path), sr=None, mono=True)
+            waveform = torch.from_numpy(audio).float().unsqueeze(0)
+            return waveform, int(sample_rate)
+        except Exception as librosa_error:
+            raise RuntimeError(
+                f"오디오 파일을 열 수 없습니다. torchaudio: {torchaudio_error}; librosa: {librosa_error}"
+            ) from librosa_error
 
 
 def estimate_tempo_backend(mono: torch.Tensor, sample_rate: int) -> float:
@@ -278,7 +423,28 @@ def estimate_tempo_backend(mono: torch.Tensor, sample_rate: int) -> float:
     return float(best_bpm)
 
 
-def extract_notes_backend(mono: torch.Tensor, sample_rate: int) -> list[dict]:
+def estimate_tempo_librosa_backend(file_path: Path) -> float | None:
+    try:
+        import librosa
+
+        audio, sample_rate = librosa.load(str(file_path), sr=22050, mono=True, duration=MAX_ANALYSIS_SECONDS)
+        tempo, _beats = librosa.beat.beat_track(y=audio, sr=sample_rate, units="time")
+        tempo_value = float(np.asarray(tempo).reshape(-1)[0])
+        while tempo_value < 70:
+            tempo_value *= 2
+        while tempo_value > 180:
+            tempo_value /= 2
+        return tempo_value if np.isfinite(tempo_value) else None
+    except Exception:
+        return None
+
+
+def extract_notes_backend(mono: torch.Tensor, sample_rate: int, file_path: Path | None = None) -> list[dict]:
+    if file_path is not None:
+        basic_pitch_notes = extract_notes_basic_pitch_backend(file_path)
+        if basic_pitch_notes:
+            return basic_pitch_notes
+
     frame_time = 0.02
     win_length = int(sample_rate * frame_time)
     if mono.numel() < win_length:
@@ -342,6 +508,113 @@ def extract_notes_backend(mono: torch.Tensor, sample_rate: int) -> list[dict]:
         )
 
     return simplify_notes_backend(cleaned)[:48]
+
+
+def extract_notes_basic_pitch_backend(file_path: Path) -> list[dict]:
+    try:
+        from basic_pitch.inference import predict
+    except Exception:
+        return []
+
+    try:
+        _, _, note_events = predict(
+            str(file_path),
+            onset_threshold=0.5,
+            frame_threshold=0.3,
+            minimum_note_length=90.0,
+            minimum_frequency=80.0,
+            maximum_frequency=1200.0,
+        )
+    except Exception:
+        return []
+
+    notes: list[dict] = []
+    for event in note_events:
+        if len(event) < 4:
+            continue
+
+        start, end, midi, amplitude = event[:4]
+        duration = float(end) - float(start)
+        if duration < 0.08 or float(amplitude) < 0.12:
+            continue
+
+        midi_int = int(round(float(midi)))
+        frequency = 440.0 * (2 ** ((midi_int - 69) / 12))
+        notes.append(
+            {
+                "note": midi_to_note_name(midi_int),
+                "midi": midi_int,
+                "start": round(float(start), 2),
+                "end": round(float(end), 2),
+                "duration": round(duration, 2),
+                "frequency": round(frequency, 1),
+                "amplitude": round(float(amplitude), 3),
+            }
+        )
+
+    notes.sort(key=lambda note: (note["start"], -note["duration"]))
+    return select_melody_notes_backend(simplify_notes_backend(notes))[:96]
+
+
+def select_melody_notes_backend(notes: list[dict]) -> list[dict]:
+    if not notes:
+        return []
+
+    amplitudes = [float(note.get("amplitude", 0.0)) for note in notes if "amplitude" in note]
+    amplitude_floor = 0.0
+    if amplitudes:
+        amplitude_floor = max(0.18, float(np.percentile(amplitudes, 45)))
+
+    candidates = [
+        note
+        for note in notes
+        if 60 <= int(note["midi"]) <= 86
+        and float(note["duration"]) >= 0.1
+        and float(note.get("amplitude", 1.0)) >= amplitude_floor
+    ]
+    if not candidates:
+        candidates = [
+            note
+            for note in notes
+            if 55 <= int(note["midi"]) <= 88 and float(note["duration"]) >= 0.12
+        ]
+
+    grouped: list[dict] = []
+    index = 0
+    candidates.sort(key=lambda note: (note["start"], -melody_note_score_backend(note)))
+    while index < len(candidates):
+        current = candidates[index]
+        group = [current]
+        index += 1
+        while index < len(candidates) and candidates[index]["start"] - current["start"] <= 0.12:
+            group.append(candidates[index])
+            index += 1
+
+        grouped.append(max(group, key=melody_note_score_backend))
+
+    melody: list[dict] = []
+    for note in grouped:
+        previous = melody[-1] if melody else None
+        if previous and note["start"] < previous["end"] - 0.05:
+            if melody_note_score_backend(note) > melody_note_score_backend(previous) * 1.15:
+                melody[-1] = note
+            continue
+
+        if previous and abs(note["midi"] - previous["midi"]) >= 12 and note["duration"] < 0.22:
+            continue
+
+        melody.append(note)
+
+    return melody
+
+
+def melody_note_score_backend(note: dict) -> float:
+    midi = int(note["midi"])
+    duration = float(note["duration"])
+    amplitude = float(note.get("amplitude", 0.4))
+    vocal_center_bonus = 1.0 - min(abs(midi - 72) / 24, 1.0) * 0.35
+    duration_bonus = min(duration, 1.2) / 1.2
+    return amplitude * 4.0 + duration_bonus * 1.2 + vocal_center_bonus
 
 
 def simplify_notes_backend(notes: list[dict]) -> list[dict]:
@@ -456,6 +729,53 @@ def estimate_chords_backend(mono: torch.Tensor, sample_rate: int, bpm: float, ke
     return simplify_chord_segments_backend(segments, beat_duration)
 
 
+def estimate_chords_librosa_backend(file_path: Path, bpm: float, key_label: str, duration_seconds: float) -> list[dict]:
+    try:
+        import librosa
+
+        audio, sample_rate = librosa.load(str(file_path), sr=22050, mono=True, duration=MAX_ANALYSIS_SECONDS)
+        if audio.size < sample_rate:
+            return []
+
+        chroma = librosa.feature.chroma_cqt(y=audio, sr=sample_rate, hop_length=1024, bins_per_octave=36)
+        frame_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sample_rate, hop_length=1024)
+    except Exception:
+        return []
+
+    beat_duration = 60.0 / max(60.0, bpm)
+    bar_duration = beat_duration * 4
+    key_profile = build_key_profile_backend(key_label)
+    segments: list[dict] = []
+    previous_chord = ""
+    start = 0.0
+
+    while start < duration_seconds:
+        end = min(start + bar_duration, duration_seconds)
+        frame_mask = (frame_times >= start) & (frame_times < end)
+        if not frame_mask.any():
+            start = end
+            continue
+
+        segment_chroma = np.median(chroma[:, frame_mask], axis=1).astype(np.float32)
+        total = float(segment_chroma.sum())
+        if total <= 1e-6:
+            chord = "N.C."
+        else:
+            segment_chroma /= total
+            chord = best_chord_for_chroma(segment_chroma, key_profile, previous_chord)
+
+        segment = {"start": round(start, 2), "end": round(end, 2), "chord": chord}
+        if segments and segments[-1]["chord"] == chord:
+            segments[-1]["end"] = segment["end"]
+        else:
+            segments.append(segment)
+
+        previous_chord = chord
+        start = end
+
+    return simplify_chord_segments_backend(segments, beat_duration)
+
+
 def build_key_profile_backend(key_label: str) -> set[int]:
     tonic_name, _, mode = key_label.partition(" ")
     if tonic_name not in NOTE_NAMES:
@@ -473,8 +793,6 @@ def best_chord_for_chroma(chroma: np.ndarray, key_profile: set[int], previous_ch
             ("", [0, 4, 7]),
             ("m", [0, 3, 7]),
             ("7", [0, 4, 7, 10]),
-            ("maj7", [0, 4, 7, 11]),
-            ("m7", [0, 3, 7, 10]),
         ]:
             hit = 0.0
             miss = 0.0
@@ -489,11 +807,11 @@ def best_chord_for_chroma(chroma: np.ndarray, key_profile: set[int], previous_ch
                     miss += chroma[pitch] * 0.42
 
             score = hit - miss + diatonic
-            if suffix in {"7", "maj7", "m7"}:
-                score -= 0.18
+            if suffix == "7":
+                score -= 0.45
             name = f"{NOTE_NAMES[root]}{suffix}"
             if name == previous_chord:
-                score += 0.5
+                score += 0.25
             if score > best_score:
                 best_score = score
                 best_name = name
@@ -554,6 +872,28 @@ def detect_sections_backend(chords: list[dict], duration_seconds: float) -> list
             }
         )
     return sections
+
+
+def build_analysis_basis_backend(source_separation: str) -> str:
+    if source_separation == "demucs":
+        return "앞 90초를 Demucs로 보컬/반주 분리한 뒤, 보컬은 Basic Pitch 멜로디, 반주는 추정 BPM과 1마디 단위 chroma 코드로 스케치했습니다."
+    return "앞 90초를 4/4, 추정 BPM, 1마디 단위 chroma 코드, Basic Pitch 보컬 후보 멜로디로 스케치했습니다."
+
+
+def build_analysis_warnings_backend(chords: list[dict], duration_seconds: float, source_separation: str) -> list[str]:
+    warnings: list[str] = []
+    if source_separation != "demucs":
+        warnings.append("보컬/반주 분리를 사용하지 못해 완성곡 믹스에서 직접 추정했습니다. 멜로디와 코드 정확도가 낮을 수 있습니다.")
+    if duration_seconds >= 30 and chords:
+        spans: dict[str, float] = {}
+        for segment in chords:
+            spans[segment["chord"]] = spans.get(segment["chord"], 0.0) + max(0.0, segment["end"] - segment["start"])
+        dominant_span = max(spans.values()) if spans else 0.0
+        if dominant_span / max(duration_seconds, 1.0) >= 0.7:
+            warnings.append("코드가 한두 개로 과도하게 수렴했습니다. 라이브 믹스/반주 에너지 때문에 코드 신뢰도가 낮을 수 있습니다.")
+    if duration_seconds >= 30 and len(chords) <= 3:
+        warnings.append("코드 변화가 적게 감지되어 실제 진행보다 단순화되었을 수 있습니다.")
+    return warnings
 
 
 def midi_to_note_name(midi: int) -> str:
